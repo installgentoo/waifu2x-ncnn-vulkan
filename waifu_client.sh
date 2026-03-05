@@ -17,7 +17,7 @@ OUTPUT=""
 NOISE=1
 SCALE=2
 FORMAT="png"
-STATUS_FILE=""
+STATUS_PIPE=""
 
 while getopts ":i:o:n:s:f:h" opt; do
   case "$opt" in
@@ -52,7 +52,7 @@ read_pid() { [[ -s "$1" ]] && cat "$1" || true; }
 
 
 cleanup_client_state() {
-  [[ -n "$STATUS_FILE" ]] && rm -f "$STATUS_FILE"
+  [[ -n "$STATUS_PIPE" ]] && rm -f "$STATUS_PIPE"
 }
 
 trap cleanup_client_state EXIT
@@ -107,17 +107,14 @@ ensure_watchdog_unlocked() {
 }
 
 wait_for_status() {
-  export STATUS_FILE
-  timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu '
-    while :; do
-      if [[ -s "$STATUS_FILE" ]]; then
-        status=$(head -n 1 "$STATUS_FILE" 2>/dev/null || true)
-        [[ "$status" == "OK" ]] && exit 0
-        [[ "$status" == "FAIL" ]] && exit 2
-      fi
-      sleep 0.05
-    done
-  '
+  local status
+  if ! status=$(timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu 'IFS= read -r line < "$1"; printf "%s" "$line"' _ "$STATUS_PIPE"); then
+    return 1
+  fi
+
+  [[ "$status" == "OK" ]] && return 0
+  [[ "$status" == "FAIL" ]] && return 2
+  return 1
 }
 
 
@@ -147,11 +144,12 @@ fi
 
 ensure_watchdog_unlocked
 
-STATUS_FILE="$WAIFU_STATE_DIR/status.$$.${RANDOM}"
-rm -f "$STATUS_FILE"
+STATUS_PIPE="$WAIFU_STATE_DIR/status.$$.${RANDOM}.fifo"
+rm -f "$STATUS_PIPE"
+mkfifo "$STATUS_PIPE"
 
 {
-  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT" -p "$STATUS_FILE"
+  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT" -p "$STATUS_PIPE"
   printf '\0'
 } > "$PIPE"
 touch "$LAST_USE_FILE"
