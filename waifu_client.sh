@@ -107,6 +107,7 @@ wait_for_output() {
       outbase=$(basename "$OUTPUT")
       mkdir -p "$outdir"
       while :; do
+        [[ -s "$OUTPUT" ]] && exit 0
         got=$(inotifywait -q -t 1 -e close_write,moved_to --format "%f" "$outdir" 2>/dev/null || true)
         [[ "$got" == "$outbase" ]] || continue
         [[ -s "$OUTPUT" ]] && exit 0
