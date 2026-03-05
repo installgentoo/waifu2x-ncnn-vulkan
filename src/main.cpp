@@ -4,6 +4,7 @@
 #include <string.h>
 #include <algorithm>
 #include <queue>
+#include <string>
 #include <vector>
 // image decoder and encoder with libjpeg and libpng
 #include "jpeg_image.h"
@@ -52,6 +53,119 @@ static void print_usage()
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
     fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stdout, "  -D pipe-file         daemon mode, read per-job args from named pipe\n");
+}
+
+class Args
+{
+public:
+    path_t inputpath;
+    path_t outputpath;
+    int noise;
+    int scale;
+    std::vector<int> tilesize;
+    path_t model;
+    std::vector<int> gpuid;
+    int jobs_load;
+    std::vector<int> jobs_proc;
+    int jobs_save;
+    int verbose;
+    int tta_mode;
+    path_t format;
+    path_t daemon_pipe;
+
+    Args()
+        : noise(0), scale(2), model(PATHSTR("models-cunet")), jobs_load(1), jobs_save(2), verbose(0), tta_mode(0), format(PATHSTR("png"))
+    {
+    }
+};
+
+class ParsedFlags
+{
+public:
+    bool has_input;
+    bool has_output;
+    bool has_noise;
+    bool has_scale;
+    bool has_tilesize;
+    bool has_model;
+    bool has_gpuid;
+    bool has_jobs;
+    bool has_format;
+    bool has_verbose;
+    bool has_tta;
+    bool has_daemon;
+
+    ParsedFlags()
+        : has_input(false), has_output(false), has_noise(false), has_scale(false), has_tilesize(false), has_model(false), has_gpuid(false), has_jobs(false), has_format(false), has_verbose(false), has_tta(false), has_daemon(false)
+    {
+    }
+};
+
+static int parse_args(int argc, char** argv, Args& args, ParsedFlags& flags)
+{
+    int opt;
+    optind = 1;
+    opterr = 0;
+    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:D:vxh")) != -1)
+    {
+        switch (opt)
+        {
+        case 'i':
+            args.inputpath = optarg;
+            flags.has_input = true;
+            break;
+        case 'o':
+            args.outputpath = optarg;
+            flags.has_output = true;
+            break;
+        case 'n':
+            args.noise = atoi(optarg);
+            flags.has_noise = true;
+            break;
+        case 's':
+            args.scale = atoi(optarg);
+            flags.has_scale = true;
+            break;
+        case 't':
+            args.tilesize = parse_optarg_int_array(optarg);
+            flags.has_tilesize = true;
+            break;
+        case 'm':
+            args.model = optarg;
+            flags.has_model = true;
+            break;
+        case 'g':
+            args.gpuid = parse_optarg_int_array(optarg);
+            flags.has_gpuid = true;
+            break;
+        case 'j':
+            sscanf(optarg, "%d:%*[^:]:%d", &args.jobs_load, &args.jobs_save);
+            args.jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
+            flags.has_jobs = true;
+            break;
+        case 'f':
+            args.format = optarg;
+            flags.has_format = true;
+            break;
+        case 'D':
+            args.daemon_pipe = optarg;
+            flags.has_daemon = true;
+            break;
+        case 'v':
+            args.verbose = 1;
+            flags.has_verbose = true;
+            break;
+        case 'x':
+            args.tta_mode = 1;
+            flags.has_tta = true;
+            break;
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 class Task
@@ -116,94 +230,109 @@ private:
 TaskQueue toproc;
 TaskQueue tosave;
 
-class LoadThreadParams
+class Session
 {
 public:
-    int scale;
-    int jobs_load;
+    Session() : pending(0) {}
 
-    // session data
-    std::vector<path_t> input_files;
-    std::vector<path_t> output_files;
+    void start_task()
+    {
+        lock.lock();
+        pending++;
+        lock.unlock();
+    }
+
+    void finish_task()
+    {
+        lock.lock();
+        pending--;
+        cond.signal();
+        lock.unlock();
+    }
+
+    void wait_all()
+    {
+        lock.lock();
+        while (pending > 0)
+            cond.wait(lock);
+        lock.unlock();
+    }
+
+private:
+    ncnn::Mutex lock;
+    ncnn::ConditionVariable cond;
+    int pending;
 };
 
-void* load(void* args)
+Session session;
+
+static int enqueue_image_task(const path_t& inputpath, const path_t& outputpath, int scale, int id)
 {
-    const LoadThreadParams* ltp = (const LoadThreadParams*)args;
-    const int count = ltp->input_files.size();
-    const int scale = ltp->scale;
+    unsigned char* pixeldata = 0;
+    int w;
+    int h;
+    int c;
 
-    #pragma omp parallel for schedule(static,1) num_threads(ltp->jobs_load)
-    for (int i=0; i<count; i++)
+    FILE* fp = fopen(inputpath.c_str(), "rb");
+    if (fp)
     {
-        const path_t& imagepath = ltp->input_files[i];
-
-        unsigned char* pixeldata = 0;
-        int w;
-        int h;
-        int c;
-
-        FILE* fp = fopen(imagepath.c_str(), "rb");
-        if (fp)
+        // read whole file
+        unsigned char* filedata = 0;
+        int length = 0;
         {
-            // read whole file
-            unsigned char* filedata = 0;
-            int length = 0;
-            {
-                fseek(fp, 0, SEEK_END);
-                length = ftell(fp);
-                rewind(fp);
-                filedata = (unsigned char*)malloc(length);
-                if (filedata)
-                {
-                    fread(filedata, 1, length, fp);
-                }
-                fclose(fp);
-            }
-
+            fseek(fp, 0, SEEK_END);
+            length = ftell(fp);
+            rewind(fp);
+            filedata = (unsigned char*)malloc(length);
             if (filedata)
             {
-                pixeldata = webp_load(filedata, length, &w, &h, &c);
+                fread(filedata, 1, length, fp);
+            }
+            fclose(fp);
+        }
+
+        if (filedata)
+        {
+            pixeldata = webp_load(filedata, length, &w, &h, &c);
+            if (!pixeldata)
+            {
+                // not webp, try jpg png etc.
+                pixeldata = jpeg_load(filedata, length, &w, &h, &c);
                 if (!pixeldata)
                 {
-                    // not webp, try jpg png etc.
-                    pixeldata = jpeg_load(filedata, length, &w, &h, &c);
-                    if (!pixeldata)
-                    {
-                        pixeldata = png_load(filedata, length, &w, &h, &c);
-                    }
+                    pixeldata = png_load(filedata, length, &w, &h, &c);
                 }
-
-                free(filedata);
-            }
-        }
-        if (pixeldata)
-        {
-            Task v;
-            v.id = i;
-            v.scale = scale;
-            v.inpath = imagepath;
-            v.outpath = ltp->output_files[i];
-
-            v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
-
-            path_t ext = get_file_extension(v.outpath);
-            if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
-            {
-                path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
-                v.outpath = output_filename2;
-                fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
             }
 
-            toproc.put(v);
-        }
-        else
-        {
-            fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
+            free(filedata);
         }
     }
 
-    return 0;
+    if (!pixeldata)
+    {
+        fprintf(stderr, "decode image %s failed\n", inputpath.c_str());
+        return -1;
+    }
+
+    Task v;
+    v.id = id;
+    v.scale = scale;
+    v.inpath = inputpath;
+    v.outpath = outputpath;
+    v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+
+    path_t ext = get_file_extension(v.outpath);
+    if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
+    {
+        path_t output_filename2 = outputpath + PATHSTR(".png");
+        v.outpath = output_filename2;
+        fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", inputpath.c_str(), inputpath.c_str(), output_filename2.c_str());
+    }
+
+    session.start_task();
+    toproc.put(v);
+
+    return 1;
 }
 
 class ProcThreadParams
@@ -327,6 +456,8 @@ void* save(void* args)
         {
             fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
         }
+
+        session.finish_task();
     }
 
     return 0;
@@ -335,71 +466,33 @@ void* save(void* args)
 
 int main(int argc, char** argv)
 {
-    path_t inputpath;
-    path_t outputpath;
-    int noise = 0;
-    int scale = 2;
-    std::vector<int> tilesize;
-    path_t model = PATHSTR("models-cunet");
-    std::vector<int> gpuid;
-    int jobs_load = 1;
-    std::vector<int> jobs_proc;
-    int jobs_save = 2;
-    int verbose = 0;
-    int tta_mode = 0;
-    path_t format = PATHSTR("png");
-
-    int opt;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
-    {
-        switch (opt)
-        {
-        case 'i':
-            inputpath = optarg;
-            break;
-        case 'o':
-            outputpath = optarg;
-            break;
-        case 'n':
-            noise = atoi(optarg);
-            break;
-        case 's':
-            scale = atoi(optarg);
-            break;
-        case 't':
-            tilesize = parse_optarg_int_array(optarg);
-            break;
-        case 'm':
-            model = optarg;
-            break;
-        case 'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case 'j':
-            sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
-            break;
-        case 'f':
-            format = optarg;
-            break;
-        case 'v':
-            verbose = 1;
-            break;
-        case 'x':
-            tta_mode = 1;
-            break;
-        case 'h':
-        default:
-            print_usage();
-            return -1;
-        }
-    }
-
-    if (inputpath.empty() || outputpath.empty())
+    Args args;
+    ParsedFlags flags;
+    if (parse_args(argc, argv, args, flags) != 0)
     {
         print_usage();
         return -1;
     }
+
+    const bool daemon_mode = !args.daemon_pipe.empty();
+
+    if ((args.inputpath.empty() || args.outputpath.empty()) && !daemon_mode)
+    {
+        print_usage();
+        return -1;
+    }
+
+    int noise = args.noise;
+    int scale = args.scale;
+    std::vector<int> tilesize = args.tilesize;
+    path_t model = args.model;
+    std::vector<int> gpuid = args.gpuid;
+    int jobs_load = args.jobs_load;
+    std::vector<int> jobs_proc = args.jobs_proc;
+    int jobs_save = args.jobs_save;
+    int verbose = args.verbose;
+    int tta_mode = args.tta_mode;
+    path_t format = args.format;
 
     if (noise < -1 || noise > 3)
     {
@@ -449,10 +542,10 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (!daemon_mode && !path_is_directory(args.outputpath))
     {
         // guess format from outputpath no matter what format argument specified
-        path_t ext = get_file_extension(outputpath);
+        path_t ext = get_file_extension(args.outputpath);
 
         if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
         {
@@ -479,18 +572,10 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    // only accept single-file input and output path
-    std::vector<path_t> input_files;
-    std::vector<path_t> output_files;
+    if (!daemon_mode && (path_is_directory(args.inputpath) || path_is_directory(args.outputpath)))
     {
-        if (path_is_directory(inputpath) || path_is_directory(outputpath))
-        {
-            fprintf(stderr, "inputpath and outputpath must be file paths\n");
-            return -1;
-        }
-
-        input_files.push_back(inputpath);
-        output_files.push_back(outputpath);
+        fprintf(stderr, "inputpath and outputpath must be file paths\n");
+        return -1;
     }
 
     int prepadding = 0;
@@ -658,15 +743,6 @@ int main(int argc, char** argv)
 
         // main routine
         {
-            // load image
-            LoadThreadParams ltp;
-            ltp.scale = scale;
-            ltp.jobs_load = jobs_load;
-            ltp.input_files = input_files;
-            ltp.output_files = output_files;
-
-            ncnn::Thread load_thread(load, (void*)&ltp);
-
             // waifu2x proc
             std::vector<ProcThreadParams> ptp(use_gpu_count);
             for (int i=0; i<use_gpu_count; i++)
@@ -703,16 +779,118 @@ int main(int argc, char** argv)
                 save_threads[i] = new ncnn::Thread(save, (void*)&stp);
             }
 
-            // end
-            load_thread.join();
+            int task_id = 0;
+            if (daemon_mode)
+            {
+                FILE* pipefp = fopen(args.daemon_pipe.c_str(), "r");
+                if (!pipefp)
+                {
+                    fprintf(stderr, "open daemon pipe %s failed\n", args.daemon_pipe.c_str());
+                }
+                else
+                {
+                    char line[4096];
+                    while (fgets(line, sizeof(line), pipefp))
+                    {
+                        char* line_argv[256];
+                        int line_argc = 1;
+                        line_argv[0] = argv[0];
+
+                        char* token = strtok(line, " \t\r\n");
+                        while (token && line_argc < 255)
+                        {
+                            line_argv[line_argc++] = token;
+                            token = strtok(0, " \t\r\n");
+                        }
+
+                        if (line_argc <= 1)
+                            continue;
+
+                        Args task_args = args;
+                        task_args.inputpath.clear();
+                        task_args.outputpath.clear();
+                        ParsedFlags task_flags;
+                        if (parse_args(line_argc, line_argv, task_args, task_flags) != 0)
+                        {
+                            fprintf(stderr, "invalid daemon arguments line ignored\n");
+                            continue;
+                        }
+
+                        if (task_flags.has_model)
+                            fprintf(stderr, "warning: -m ignored in daemon mode\n");
+                        if (task_flags.has_gpuid)
+                            fprintf(stderr, "warning: -g ignored in daemon mode\n");
+                        if (task_flags.has_jobs)
+                            fprintf(stderr, "warning: -j ignored in daemon mode\n");
+                        if (task_flags.has_tta)
+                            fprintf(stderr, "warning: -x ignored in daemon mode\n");
+                        if (task_flags.has_daemon)
+                            fprintf(stderr, "warning: -D ignored in daemon mode\n");
+
+                        task_args.model = model;
+                        task_args.gpuid = gpuid;
+                        task_args.jobs_load = jobs_load;
+                        task_args.jobs_proc = jobs_proc;
+                        task_args.jobs_save = jobs_save;
+                        task_args.tta_mode = tta_mode;
+
+                        if (task_args.inputpath.empty() || task_args.outputpath.empty())
+                        {
+                            fprintf(stderr, "warning: daemon task requires -i and -o\n");
+                            continue;
+                        }
+
+                        if (task_args.noise < -1 || task_args.noise > 3)
+                        {
+                            fprintf(stderr, "warning: daemon task has invalid noise argument\n");
+                            continue;
+                        }
+
+                        if (!(task_args.scale == 1 || task_args.scale == 2 || task_args.scale == 4 || task_args.scale == 8 || task_args.scale == 16 || task_args.scale == 32))
+                        {
+                            fprintf(stderr, "warning: daemon task has invalid scale argument\n");
+                            continue;
+                        }
+
+                        if (!task_args.tilesize.empty() && task_args.tilesize.size() != (size_t)use_gpu_count)
+                        {
+                            fprintf(stderr, "warning: daemon task has invalid tilesize argument\n");
+                            continue;
+                        }
+
+                        if (task_args.noise != noise || (task_args.scale == 1) != (scale == 1))
+                        {
+                            if (task_flags.has_noise)
+                                fprintf(stderr, "warning: -n ignored in daemon mode due to fixed loaded model\n");
+                            if (task_flags.has_scale && ((task_args.scale == 1) != (scale == 1)))
+                                fprintf(stderr, "warning: -s ignored in daemon mode due to fixed loaded model\n");
+                            task_args.noise = noise;
+                            task_args.scale = scale;
+                        }
+
+                        for (int i=0; i<use_gpu_count; i++)
+                        {
+                            waifu2x[i]->tilesize = task_args.tilesize.empty() ? tilesize[i] : task_args.tilesize[i];
+                        }
+
+                        if (enqueue_image_task(task_args.inputpath, task_args.outputpath, task_args.scale, task_id++) > 0)
+                            session.wait_all();
+                    }
+
+                    fclose(pipefp);
+                }
+            }
+            else
+            {
+                enqueue_image_task(args.inputpath, args.outputpath, scale, task_id++);
+                session.wait_all();
+            }
 
             Task end;
             end.id = -233;
 
             for (int i=0; i<total_jobs_proc; i++)
-            {
                 toproc.put(end);
-            }
 
             for (int i=0; i<total_jobs_proc; i++)
             {
