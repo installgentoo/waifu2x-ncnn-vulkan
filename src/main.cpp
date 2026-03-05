@@ -46,8 +46,8 @@ static void print_usage()
     fprintf(stdout, "Usage: waifu2x-ncnn-vulkan -i infile -o outfile [options]...\n\n");
     fprintf(stdout, "  -h                   show this help\n");
     fprintf(stdout, "  -v                   verbose output\n");
-    fprintf(stdout, "  -i input-path        input image path (jpg/png/webp) or directory\n");
-    fprintf(stdout, "  -o output-path       output image path (jpg/png/webp) or directory\n");
+    fprintf(stdout, "  -i input-path        input image path (jpg/png/webp)\n");
+    fprintf(stdout, "  -o output-path       output image path (jpg/png/webp)\n");
     fprintf(stdout, "  -n noise-level       denoise level (-1/0/1/2/3, default=0)\n");
     fprintf(stdout, "  -s scale             upscale ratio (1/2/4/8/16/32, default=2)\n");
     fprintf(stdout, "  -t tile-size         tile size (>=32/0=auto, default=0) can be 0,0,0 for multi-gpu\n");
@@ -150,61 +150,6 @@ static int parse_options(int argc, char** argv, Options& opt, bool daemon_reques
     return 0;
 }
 
-
-static int collect_io_files(const path_t& inputpath, const path_t& outputpath, const path_t& format, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
-{
-    if (path_is_directory(inputpath) && path_is_directory(outputpath))
-    {
-        std::vector<path_t> filenames;
-        int lr = list_directory(inputpath, filenames);
-        if (lr != 0)
-            return -1;
-
-        const int count = filenames.size();
-        input_files.resize(count);
-        output_files.resize(count);
-
-        path_t last_filename;
-        path_t last_filename_noext;
-        for (int i=0; i<count; i++)
-        {
-            path_t filename = filenames[i];
-            path_t filename_noext = get_file_name_without_extension(filename);
-            path_t output_filename = filename_noext + PATHSTR('.') + format;
-
-            if (filename_noext == last_filename_noext)
-            {
-                path_t output_filename2 = filename + PATHSTR('.') + format;
-#if _WIN32
-                fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#else
-                fprintf(stderr, "both %s and %s output %s ! %s will output %s\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#endif
-                output_filename = output_filename2;
-            }
-            else
-            {
-                last_filename = filename;
-                last_filename_noext = filename_noext;
-            }
-
-            input_files[i] = inputpath + PATHSTR('/') + filename;
-            output_files[i] = outputpath + PATHSTR('/') + output_filename;
-        }
-    }
-    else if (!path_is_directory(inputpath) && !path_is_directory(outputpath))
-    {
-        input_files.push_back(inputpath);
-        output_files.push_back(outputpath);
-    }
-    else
-    {
-        fprintf(stderr, "inputpath and outputpath must be either file or directory at the same time\n");
-        return -1;
-    }
-
-    return 0;
-}
 
 class Task
 {
@@ -608,28 +553,31 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!outputpath.empty() && !path_is_directory(outputpath))
+    if (path_is_directory(inputpath) || path_is_directory(outputpath))
     {
-        // guess format from outputpath no matter what format argument specified
-        path_t ext = get_file_extension(outputpath);
+        fprintf(stderr, "directory input/output is not supported\n");
+        return -1;
+    }
 
-        if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-        {
-            format = PATHSTR("png");
-        }
-        else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-        {
-            format = PATHSTR("webp");
-        }
-        else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-        {
-            format = PATHSTR("jpg");
-        }
-        else
-        {
-            fprintf(stderr, "invalid outputpath extension type\n");
-            return -1;
-        }
+    // guess format from outputpath no matter what format argument specified
+    path_t ext = get_file_extension(outputpath);
+
+    if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+    {
+        format = PATHSTR("png");
+    }
+    else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+    {
+        format = PATHSTR("webp");
+    }
+    else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+    {
+        format = PATHSTR("jpg");
+    }
+    else
+    {
+        fprintf(stderr, "invalid outputpath extension type\n");
+        return -1;
     }
 
     if (format != PATHSTR("png") && format != PATHSTR("webp") && format != PATHSTR("jpg"))
@@ -726,7 +674,6 @@ int main(int argc, char** argv)
     }
 
     int total_jobs_proc = 0;
-    int jobs_proc_per_gpu[16] = {0};
     for (int i=0; i<use_gpu_count; i++)
     {
         if (gpuid[i] == -1)
@@ -737,7 +684,6 @@ int main(int argc, char** argv)
         else
         {
             total_jobs_proc += jobs_proc[i];
-            jobs_proc_per_gpu[gpuid[i]] += jobs_proc[i];
         }
     }
 
@@ -754,12 +700,6 @@ int main(int argc, char** argv)
         }
 
         uint32_t heap_budget = ncnn::get_gpu_device(gpuid[i])->get_heap_budget();
-
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
-        {
-            // multiple gpu jobs share the same heap
-            heap_budget /= jobs_proc_per_gpu[gpuid[i]];
-        }
 
         // more fine-grained tilesize policy here
         if (model.find(PATHSTR("models-cunet")) != path_t::npos)
@@ -850,20 +790,23 @@ int main(int argc, char** argv)
                     return -1;
                 }
 
-                if (!path_is_directory(req_output))
+                if (path_is_directory(req_input) || path_is_directory(req_output))
                 {
-                    path_t ext = get_file_extension(req_output);
-                    if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
-                        req_format = PATHSTR("png");
-                    else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
-                        req_format = PATHSTR("webp");
-                    else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
-                        req_format = PATHSTR("jpg");
-                    else
-                    {
-                        fprintf(stderr, "invalid outputpath extension type\n");
-                        return -1;
-                    }
+                    fprintf(stderr, "directory input/output is not supported\n");
+                    return -1;
+                }
+
+                path_t ext = get_file_extension(req_output);
+                if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+                    req_format = PATHSTR("png");
+                else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+                    req_format = PATHSTR("webp");
+                else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+                    req_format = PATHSTR("jpg");
+                else
+                {
+                    fprintf(stderr, "invalid outputpath extension type\n");
+                    return -1;
                 }
 
                 if (req_format != PATHSTR("png") && req_format != PATHSTR("webp") && req_format != PATHSTR("jpg"))
@@ -872,10 +815,8 @@ int main(int argc, char** argv)
                     return -1;
                 }
 
-                std::vector<path_t> req_inputs;
-                std::vector<path_t> req_outputs;
-                if (collect_io_files(req_input, req_output, req_format, req_inputs, req_outputs) != 0)
-                    return -1;
+                std::vector<path_t> req_inputs(1, req_input);
+                std::vector<path_t> req_outputs(1, req_output);
 
                 LoadThreadParams ltp;
                 ltp.scale = scale;
