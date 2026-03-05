@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <queue>
 #include <vector>
+#include <string>
+#include <sstream>
 #include <clocale>
 
 #if _WIN32
@@ -106,6 +108,157 @@ static void print_usage()
     fprintf(stdout, "  -j load:proc:save    thread count for load/proc/save (default=1:2:2) can be 1:2,2,2:2 for multi-gpu\n");
     fprintf(stdout, "  -x                   enable tta mode\n");
     fprintf(stdout, "  -f format            output image format (jpg/png/webp, default=ext/png)\n");
+    fprintf(stdout, "  -D pipe-file         daemon mode, read request arguments from pipe file\n");
+}
+
+class Options
+{
+public:
+    path_t inputpath;
+    path_t outputpath;
+    int noise = 0;
+    int scale = 2;
+    std::vector<int> tilesize;
+    path_t model = PATHSTR("models-cunet");
+    std::vector<int> gpuid;
+    int jobs_load = 1;
+    std::vector<int> jobs_proc;
+    int jobs_save = 2;
+    int verbose = 0;
+    int tta_mode = 0;
+    path_t format = PATHSTR("png");
+    path_t daemon_pipe;
+};
+
+#ifndef _WIN32
+static bool is_daemon_conflicting_option(int opt)
+{
+    return opt == 'n' || opt == 's' || opt == 't' || opt == 'm' || opt == 'g' || opt == 'j' || opt == 'x' || opt == 'v';
+}
+
+static int parse_options(int argc, char** argv, Options& opt, bool daemon_request)
+{
+    optind = 1;
+    int c;
+    while ((c = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:D:vxh")) != -1)
+    {
+        if (daemon_request && is_daemon_conflicting_option(c))
+        {
+            fprintf(stderr, "warning: ignoring -%c in daemon request\n", c);
+            continue;
+        }
+
+        switch (c)
+        {
+        case 'i':
+            opt.inputpath = optarg;
+            break;
+        case 'o':
+            opt.outputpath = optarg;
+            break;
+        case 'n':
+            opt.noise = atoi(optarg);
+            break;
+        case 's':
+            opt.scale = atoi(optarg);
+            break;
+        case 't':
+            opt.tilesize = parse_optarg_int_array(optarg);
+            break;
+        case 'm':
+            opt.model = optarg;
+            break;
+        case 'g':
+            opt.gpuid = parse_optarg_int_array(optarg);
+            break;
+        case 'j':
+            sscanf(optarg, "%d:%*[^:]:%d", &opt.jobs_load, &opt.jobs_save);
+            opt.jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
+            break;
+        case 'f':
+            opt.format = optarg;
+            break;
+        case 'D':
+            if (daemon_request)
+            {
+                fprintf(stderr, "warning: ignoring -D in daemon request\n");
+            }
+            else
+            {
+                opt.daemon_pipe = optarg;
+            }
+            break;
+        case 'v':
+            opt.verbose = 1;
+            break;
+        case 'x':
+            opt.tta_mode = 1;
+            break;
+        case 'h':
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+
+#endif // _WIN32
+
+static int collect_io_files(const path_t& inputpath, const path_t& outputpath, const path_t& format, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
+{
+    if (path_is_directory(inputpath) && path_is_directory(outputpath))
+    {
+        std::vector<path_t> filenames;
+        int lr = list_directory(inputpath, filenames);
+        if (lr != 0)
+            return -1;
+
+        const int count = filenames.size();
+        input_files.resize(count);
+        output_files.resize(count);
+
+        path_t last_filename;
+        path_t last_filename_noext;
+        for (int i=0; i<count; i++)
+        {
+            path_t filename = filenames[i];
+            path_t filename_noext = get_file_name_without_extension(filename);
+            path_t output_filename = filename_noext + PATHSTR('.') + format;
+
+            if (filename_noext == last_filename_noext)
+            {
+                path_t output_filename2 = filename + PATHSTR('.') + format;
+#if _WIN32
+                fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
+#else
+                fprintf(stderr, "both %s and %s output %s ! %s will output %s\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
+#endif
+                output_filename = output_filename2;
+            }
+            else
+            {
+                last_filename = filename;
+                last_filename_noext = filename_noext;
+            }
+
+            input_files[i] = inputpath + PATHSTR('/') + filename;
+            output_files[i] = outputpath + PATHSTR('/') + output_filename;
+        }
+    }
+    else if (!path_is_directory(inputpath) && !path_is_directory(outputpath))
+    {
+        input_files.push_back(inputpath);
+        output_files.push_back(outputpath);
+    }
+    else
+    {
+        fprintf(stderr, "inputpath and outputpath must be either file or directory at the same time\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 class Task
@@ -169,6 +322,9 @@ private:
 
 TaskQueue toproc;
 TaskQueue tosave;
+ncnn::Mutex g_done_lock;
+ncnn::ConditionVariable g_done_condition;
+int g_done_count = 0;
 
 class LoadThreadParams
 {
@@ -270,6 +426,11 @@ void* load(void* args)
 #else // _WIN32
             fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
 #endif // _WIN32
+
+            g_done_lock.lock();
+            g_done_count++;
+            g_done_lock.unlock();
+            g_done_condition.signal();
         }
     }
 
@@ -413,6 +574,11 @@ void* save(void* args)
             fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
 #endif
         }
+
+        g_done_lock.lock();
+        g_done_count++;
+        g_done_lock.unlock();
+        g_done_condition.signal();
     }
 
     return 0;
@@ -425,60 +591,51 @@ int wmain(int argc, wchar_t** argv)
 int main(int argc, char** argv)
 #endif
 {
-    path_t inputpath;
-    path_t outputpath;
-    int noise = 0;
-    int scale = 2;
-    std::vector<int> tilesize;
-    path_t model = PATHSTR("models-cunet");
-    std::vector<int> gpuid;
-    int jobs_load = 1;
-    std::vector<int> jobs_proc;
-    int jobs_save = 2;
-    int verbose = 0;
-    int tta_mode = 0;
-    path_t format = PATHSTR("png");
+    Options opt;
 
 #if _WIN32
     setlocale(LC_ALL, "");
-    wchar_t opt;
-    while ((opt = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:vxh")) != (wchar_t)-1)
+    wchar_t c;
+    while ((c = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:D:vxh")) != (wchar_t)-1)
     {
-        switch (opt)
+        switch (c)
         {
         case L'i':
-            inputpath = optarg;
+            opt.inputpath = optarg;
             break;
         case L'o':
-            outputpath = optarg;
+            opt.outputpath = optarg;
             break;
         case L'n':
-            noise = _wtoi(optarg);
+            opt.noise = _wtoi(optarg);
             break;
         case L's':
-            scale = _wtoi(optarg);
+            opt.scale = _wtoi(optarg);
             break;
         case L't':
-            tilesize = parse_optarg_int_array(optarg);
+            opt.tilesize = parse_optarg_int_array(optarg);
             break;
         case L'm':
-            model = optarg;
+            opt.model = optarg;
             break;
         case L'g':
-            gpuid = parse_optarg_int_array(optarg);
+            opt.gpuid = parse_optarg_int_array(optarg);
             break;
         case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
+            swscanf(optarg, L"%d:%*[^:]:%d", &opt.jobs_load, &opt.jobs_save);
+            opt.jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
             break;
         case L'f':
-            format = optarg;
+            opt.format = optarg;
+            break;
+        case L'D':
+            opt.daemon_pipe = optarg;
             break;
         case L'v':
-            verbose = 1;
+            opt.verbose = 1;
             break;
         case L'x':
-            tta_mode = 1;
+            opt.tta_mode = 1;
             break;
         case L'h':
         default:
@@ -487,54 +644,28 @@ int main(int argc, char** argv)
         }
     }
 #else // _WIN32
-    int opt;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:vxh")) != -1)
+    if (parse_options(argc, argv, opt, false) != 0)
     {
-        switch (opt)
-        {
-        case 'i':
-            inputpath = optarg;
-            break;
-        case 'o':
-            outputpath = optarg;
-            break;
-        case 'n':
-            noise = atoi(optarg);
-            break;
-        case 's':
-            scale = atoi(optarg);
-            break;
-        case 't':
-            tilesize = parse_optarg_int_array(optarg);
-            break;
-        case 'm':
-            model = optarg;
-            break;
-        case 'g':
-            gpuid = parse_optarg_int_array(optarg);
-            break;
-        case 'j':
-            sscanf(optarg, "%d:%*[^:]:%d", &jobs_load, &jobs_save);
-            jobs_proc = parse_optarg_int_array(strchr(optarg, ':') + 1);
-            break;
-        case 'f':
-            format = optarg;
-            break;
-        case 'v':
-            verbose = 1;
-            break;
-        case 'x':
-            tta_mode = 1;
-            break;
-        case 'h':
-        default:
-            print_usage();
-            return -1;
-        }
+        print_usage();
+        return -1;
     }
 #endif // _WIN32
 
-    if (inputpath.empty() || outputpath.empty())
+    path_t inputpath = opt.inputpath;
+    path_t outputpath = opt.outputpath;
+    int noise = opt.noise;
+    int scale = opt.scale;
+    std::vector<int> tilesize = opt.tilesize;
+    path_t model = opt.model;
+    std::vector<int> gpuid = opt.gpuid;
+    int jobs_load = opt.jobs_load;
+    std::vector<int> jobs_proc = opt.jobs_proc;
+    int jobs_save = opt.jobs_save;
+    int verbose = opt.verbose;
+    int tta_mode = opt.tta_mode;
+    path_t format = opt.format;
+
+    if (opt.daemon_pipe.empty() && (inputpath.empty() || outputpath.empty()))
     {
         print_usage();
         return -1;
@@ -588,7 +719,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (!path_is_directory(outputpath))
+    if (!outputpath.empty() && !path_is_directory(outputpath))
     {
         // guess format from outputpath no matter what format argument specified
         path_t ext = get_file_extension(outputpath);
@@ -618,61 +749,8 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    // collect input and output filepath
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
-    {
-        if (path_is_directory(inputpath) && path_is_directory(outputpath))
-        {
-            std::vector<path_t> filenames;
-            int lr = list_directory(inputpath, filenames);
-            if (lr != 0)
-                return -1;
-
-            const int count = filenames.size();
-            input_files.resize(count);
-            output_files.resize(count);
-
-            path_t last_filename;
-            path_t last_filename_noext;
-            for (int i=0; i<count; i++)
-            {
-                path_t filename = filenames[i];
-                path_t filename_noext = get_file_name_without_extension(filename);
-                path_t output_filename = filename_noext + PATHSTR('.') + format;
-
-                // filename list is sorted, check if output image path conflicts
-                if (filename_noext == last_filename_noext)
-                {
-                    path_t output_filename2 = filename + PATHSTR('.') + format;
-#if _WIN32
-                    fwprintf(stderr, L"both %ls and %ls output %ls ! %ls will output %ls\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#else
-                    fprintf(stderr, "both %s and %s output %s ! %s will output %s\n", filename.c_str(), last_filename.c_str(), output_filename.c_str(), filename.c_str(), output_filename2.c_str());
-#endif
-                    output_filename = output_filename2;
-                }
-                else
-                {
-                    last_filename = filename;
-                    last_filename_noext = filename_noext;
-                }
-
-                input_files[i] = inputpath + PATHSTR('/') + filename;
-                output_files[i] = outputpath + PATHSTR('/') + output_filename;
-            }
-        }
-        else if (!path_is_directory(inputpath) && !path_is_directory(outputpath))
-        {
-            input_files.push_back(inputpath);
-            output_files.push_back(outputpath);
-        }
-        else
-        {
-            fprintf(stderr, "inputpath and outputpath must be either file or directory at the same time\n");
-            return -1;
-        }
-    }
 
     int prepadding = 0;
 
@@ -866,15 +944,6 @@ int main(int argc, char** argv)
 
         // main routine
         {
-            // load image
-            LoadThreadParams ltp;
-            ltp.scale = scale;
-            ltp.jobs_load = jobs_load;
-            ltp.input_files = input_files;
-            ltp.output_files = output_files;
-
-            ncnn::Thread load_thread(load, (void*)&ltp);
-
             // waifu2x proc
             std::vector<ProcThreadParams> ptp(use_gpu_count);
             for (int i=0; i<use_gpu_count; i++)
@@ -911,8 +980,114 @@ int main(int argc, char** argv)
                 save_threads[i] = new ncnn::Thread(save, (void*)&stp);
             }
 
-            // end
-            load_thread.join();
+            auto run_one_request = [&](const path_t& req_input, const path_t& req_output, path_t req_format) -> int
+            {
+                if (req_input.empty() || req_output.empty())
+                {
+                    fprintf(stderr, "invalid request, missing input or output\n");
+                    return -1;
+                }
+
+                if (!path_is_directory(req_output))
+                {
+                    path_t ext = get_file_extension(req_output);
+                    if (ext == PATHSTR("png") || ext == PATHSTR("PNG"))
+                        req_format = PATHSTR("png");
+                    else if (ext == PATHSTR("webp") || ext == PATHSTR("WEBP"))
+                        req_format = PATHSTR("webp");
+                    else if (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG"))
+                        req_format = PATHSTR("jpg");
+                    else
+                    {
+                        fprintf(stderr, "invalid outputpath extension type\n");
+                        return -1;
+                    }
+                }
+
+                if (req_format != PATHSTR("png") && req_format != PATHSTR("webp") && req_format != PATHSTR("jpg"))
+                {
+                    fprintf(stderr, "invalid format argument\n");
+                    return -1;
+                }
+
+                std::vector<path_t> req_inputs;
+                std::vector<path_t> req_outputs;
+                if (collect_io_files(req_input, req_output, req_format, req_inputs, req_outputs) != 0)
+                    return -1;
+
+                LoadThreadParams ltp;
+                ltp.scale = scale;
+                ltp.jobs_load = jobs_load;
+                ltp.input_files = req_inputs;
+                ltp.output_files = req_outputs;
+
+                g_done_lock.lock();
+                g_done_count = 0;
+                g_done_lock.unlock();
+
+                ncnn::Thread load_thread(load, (void*)&ltp);
+                load_thread.join();
+
+                g_done_lock.lock();
+                while (g_done_count < (int)req_inputs.size())
+                {
+                    g_done_condition.wait(g_done_lock);
+                }
+                g_done_lock.unlock();
+
+                return 0;
+            };
+
+            if (opt.daemon_pipe.empty())
+            {
+                run_one_request(inputpath, outputpath, format);
+            }
+#ifndef _WIN32
+            else
+            {
+                for (;;)
+                {
+                    FILE* pipe_fp = fopen(opt.daemon_pipe.c_str(), "r");
+                    if (!pipe_fp)
+                    {
+                        fprintf(stderr, "failed to open daemon pipe %s\n", opt.daemon_pipe.c_str());
+                        break;
+                    }
+
+                    char* line = NULL;
+                    size_t linecap = 0;
+                    while (getline(&line, &linecap, pipe_fp) != -1)
+                    {
+                        std::istringstream iss(line);
+                        std::vector<std::string> tokens;
+                        std::string token;
+                        while (iss >> token)
+                            tokens.push_back(token);
+
+                        if (tokens.empty())
+                            continue;
+
+                        std::vector<char*> cargs(tokens.size() + 1);
+                        cargs[0] = (char*)"waifu2x-ncnn-vulkan";
+                        for (size_t i = 0; i < tokens.size(); i++)
+                            cargs[i + 1] = (char*)tokens[i].c_str();
+
+                        Options req;
+                        req.format = format;
+                        if (parse_options((int)cargs.size(), cargs.data(), req, true) != 0)
+                        {
+                            fprintf(stderr, "warning: invalid daemon request, ignored\n");
+                            continue;
+                        }
+
+                        run_one_request(req.inputpath, req.outputpath, req.format);
+                    }
+
+                    free(line);
+                    fclose(pipe_fp);
+                }
+            }
+#endif
 
             Task end;
             end.id = -233;
