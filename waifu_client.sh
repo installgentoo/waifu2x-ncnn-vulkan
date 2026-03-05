@@ -101,34 +101,40 @@ ensure_watchdog_unlocked() {
 
 wait_for_output() {
   if command -v inotifywait >/dev/null 2>&1; then
-    local outdir outbase
-    outdir=$(dirname "$OUTPUT")
-    outbase=$(basename "$OUTPUT")
-    mkdir -p "$outdir"
-    while :; do
-      local got
-      got=$(inotifywait -q -e close_write --format '%f' "$outdir" 2>/dev/null || true)
-      [[ "$got" == "$outbase" ]] || continue
-      [[ -s "$OUTPUT" ]] && return 0
-    done
+    export OUTPUT
+    timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu '
+      outdir=$(dirname "$OUTPUT")
+      outbase=$(basename "$OUTPUT")
+      mkdir -p "$outdir"
+      while :; do
+        got=$(inotifywait -q -t 1 -e close_write,moved_to --format "%f" "$outdir" 2>/dev/null || true)
+        [[ "$got" == "$outbase" ]] || continue
+        [[ -s "$OUTPUT" ]] && exit 0
+      done
+    '
+    return $?
   fi
-  
+
   echo "Warning: inotify-tools not installed!"
 
-  local last=-1 cur stable=0
-  while :; do
-    if [[ -f "$OUTPUT" ]]; then
-      cur=$(stat -c %s "$OUTPUT" 2>/dev/null || echo -1)
-      if [[ "$cur" -gt 0 && "$cur" -eq "$last" ]]; then
-        stable=$((stable + 1))
-      else
-        stable=0
+  export OUTPUT
+  timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu '
+    last=-1
+    stable=0
+    while :; do
+      if [[ -f "$OUTPUT" ]]; then
+        cur=$(stat -c %s "$OUTPUT" 2>/dev/null || echo -1)
+        if [[ "$cur" -gt 0 && "$cur" -eq "$last" ]]; then
+          stable=$((stable + 1))
+        else
+          stable=0
+        fi
+        (( stable >= 2 )) && exit 0
+        last="$cur"
       fi
-      (( stable >= 2 )) && return 0
-      last="$cur"
-    fi
-    sleep 0.1
-  done
+      sleep 0.1
+    done
+  '
 }
 
 exec 200>"$LOCK"
@@ -141,7 +147,10 @@ is_alive "$dpid" && alive=1 || true
 if (( alive == 1 )) && [[ -s "$STARTUP_CFG_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$STARTUP_CFG_FILE"
-  if [[ "${n:-}" != "$NOISE" || ("${s:-}" == "1") != ("$SCALE" == "1") || "${f:-}" != "$FORMAT" ]]; then
+  if [[ "${n:-}" != "$NOISE" || \
+        ( "${s:-}" == "1" && "$SCALE" != "1" ) || \
+        ( "${s:-}" != "1" && "$SCALE" == "1" ) || \
+        "${f:-}" != "$FORMAT" ]]; then
     echo "Warning: restarting daemon, scale/noise incompatible!"
     alive=0
   fi
@@ -154,9 +163,15 @@ fi
 
 ensure_watchdog_unlocked
 
-printf '%s\n' "-i $INPUT -o $OUTPUT -n $NOISE -s $SCALE -f $FORMAT" > "$PIPE"
+{
+  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT"
+  printf '\0'
+} > "$PIPE"
 touch "$LAST_USE_FILE"
 
 flock -u 200
 
-wait_for_output
+if ! wait_for_output; then
+  echo "waifu_client.sh: timed out waiting for output: $OUTPUT" >&2
+  exit 1
+fi
