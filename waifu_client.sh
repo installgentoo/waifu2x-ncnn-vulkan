@@ -17,6 +17,7 @@ OUTPUT=""
 NOISE=1
 SCALE=2
 FORMAT="png"
+STATUS_FILE=""
 
 while getopts ":i:o:n:s:f:h" opt; do
   case "$opt" in
@@ -49,6 +50,12 @@ DAEMON_LOG="$WAIFU_STATE_DIR/daemon.log"
 is_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 read_pid() { [[ -s "$1" ]] && cat "$1" || true; }
 
+
+cleanup_client_state() {
+  [[ -n "$STATUS_FILE" ]] && rm -f "$STATUS_FILE"
+}
+
+trap cleanup_client_state EXIT
 stop_server_unlocked() {
   local dpid kpid
   dpid=$(read_pid "$DAEMON_PID_FILE")
@@ -99,44 +106,20 @@ ensure_watchdog_unlocked() {
   echo $! > "$WATCHDOG_PID_FILE"
 }
 
-wait_for_output() {
-  if command -v inotifywait >/dev/null 2>&1; then
-    export OUTPUT
-    timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu '
-      outdir=$(dirname "$OUTPUT")
-      outbase=$(basename "$OUTPUT")
-      mkdir -p "$outdir"
-      while :; do
-        [[ -s "$OUTPUT" ]] && exit 0
-        got=$(inotifywait -q -t 1 -e close_write,moved_to --format "%f" "$outdir" 2>/dev/null || true)
-        [[ "$got" == "$outbase" ]] || continue
-        [[ -s "$OUTPUT" ]] && exit 0
-      done
-    '
-    return $?
-  fi
-
-  echo "Warning: inotify-tools not installed!"
-
-  export OUTPUT
+wait_for_status() {
+  export STATUS_FILE
   timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu '
-    last=-1
-    stable=0
     while :; do
-      if [[ -f "$OUTPUT" ]]; then
-        cur=$(stat -c %s "$OUTPUT" 2>/dev/null || echo -1)
-        if [[ "$cur" -gt 0 && "$cur" -eq "$last" ]]; then
-          stable=$((stable + 1))
-        else
-          stable=0
-        fi
-        (( stable >= 2 )) && exit 0
-        last="$cur"
+      if [[ -s "$STATUS_FILE" ]]; then
+        status=$(head -n 1 "$STATUS_FILE" 2>/dev/null || true)
+        [[ "$status" == "OK" ]] && exit 0
+        [[ "$status" == "FAIL" ]] && exit 2
       fi
-      sleep 0.1
+      sleep 0.05
     done
   '
 }
+
 
 exec 200>"$LOCK"
 flock 200
@@ -164,15 +147,25 @@ fi
 
 ensure_watchdog_unlocked
 
+STATUS_FILE="$WAIFU_STATE_DIR/status.$$.${RANDOM}"
+rm -f "$STATUS_FILE"
+
 {
-  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT"
+  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT" -p "$STATUS_FILE"
   printf '\0'
 } > "$PIPE"
 touch "$LAST_USE_FILE"
 
 flock -u 200
 
-if ! wait_for_output; then
-  echo "waifu_client.sh: timed out waiting for output: $OUTPUT" >&2
+if wait_for_status; then
+  :
+else
+  rc=$?
+  if (( rc == 2 )); then
+    echo "waifu_client.sh: daemon reported failure for output: $OUTPUT" >&2
+  else
+    echo "waifu_client.sh: timed out waiting for daemon status: $OUTPUT" >&2
+  fi
   exit 1
 fi
