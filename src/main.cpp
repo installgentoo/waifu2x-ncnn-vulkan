@@ -9,6 +9,7 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <utility>
 // image decoder and encoder with libjpeg and libpng
 #include "jpeg_image.h"
 #include "png_image.h"
@@ -76,6 +77,7 @@ public:
     int tta_mode;
     path_t format;
     path_t daemon_pipe;
+    path_t daemon_status_path;
 
     Args()
         : noise(0), scale(2), model(PATHSTR("models-cunet")), jobs_load(1), jobs_save(2), verbose(0), tta_mode(0), format(PATHSTR("png"))
@@ -103,7 +105,7 @@ static int parse_args(int argc, char** argv, Args& args, ParseMeta& meta)
 
     optind = 1;
     opterr = 0;
-    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:D:vxh")) != -1)
+    while ((opt = getopt(argc, argv, "i:o:n:s:t:m:g:j:f:D:p:vxh")) != -1)
     {
         switch (opt)
         {
@@ -143,6 +145,9 @@ static int parse_args(int argc, char** argv, Args& args, ParseMeta& meta)
         case 'D':
             args.daemon_pipe = optarg;
             meta.daemon_canonical = false;
+            break;
+        case 'p':
+            args.daemon_status_path = optarg;
             break;
         case 'v':
             args.verbose = 1;
@@ -247,8 +252,9 @@ public:
 };
 
 static std::atomic<int> saved_task_count(0);
-static std::mutex saved_task_count_mutex;
-static std::condition_variable saved_task_count_cv;
+static std::atomic<int> failed_task_count(0);
+static std::mutex task_count_mutex;
+static std::condition_variable task_count_cv;
 
 void* load(void* args)
 {
@@ -449,8 +455,12 @@ void* save(void* args)
             fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
         }
 
-        saved_task_count.fetch_add(1);
-        saved_task_count_cv.notify_all();
+        if (success)
+            saved_task_count.fetch_add(1);
+        else
+            failed_task_count.fetch_add(1);
+
+        task_count_cv.notify_all();
     }
 
     return 0;
@@ -789,16 +799,20 @@ int main(int argc, char** argv)
                 return enqueued_count.load();
             };
 
-            auto wait_batch = [](int expected_count)
+            auto wait_batch = [](int expected_count) -> std::pair<int, int>
             {
                 if (expected_count <= 0)
-                    return;
+                    return std::make_pair(0, 0);
 
-                const int baseline = saved_task_count.load();
-                std::unique_lock<std::mutex> guard(saved_task_count_mutex);
-                saved_task_count_cv.wait(guard, [baseline, expected_count]() {
-                    return saved_task_count.load() >= baseline + expected_count;
+                const int baseline_saved = saved_task_count.load();
+                const int baseline_failed = failed_task_count.load();
+                std::unique_lock<std::mutex> guard(task_count_mutex);
+                task_count_cv.wait(guard, [baseline_saved, baseline_failed, expected_count]() {
+                    int done = (saved_task_count.load() - baseline_saved) + (failed_task_count.load() - baseline_failed);
+                    return done >= expected_count;
                 });
+
+                return std::make_pair(saved_task_count.load() - baseline_saved, failed_task_count.load() - baseline_failed);
             };
 
             if (daemon_mode)
@@ -810,6 +824,26 @@ int main(int argc, char** argv)
                 }
                 else
                 {
+                    auto write_daemon_status = [](const path_t& status_path, const char* status)
+                    {
+                        if (status_path.empty())
+                            return;
+
+#if _WIN32
+                        FILE* statusfp = _wfopen(status_path.c_str(), L"wb");
+#else
+                        FILE* statusfp = fopen(status_path.c_str(), "wb");
+#endif
+                        if (!statusfp)
+                        {
+                            fprintf(stderr, "warning: failed to write daemon status %s\n", status_path.c_str());
+                            return;
+                        }
+
+                        fprintf(statusfp, "%s\n", status);
+                        fclose(statusfp);
+                    };
+
                     auto process_daemon_request = [&](const std::vector<std::string>& request_tokens)
                     {
                         char* line_argv[256] = {0};
@@ -831,6 +865,7 @@ int main(int argc, char** argv)
                         if (parse_args(line_argc, line_argv, task_args, task_meta) != 0)
                         {
                             fprintf(stderr, "invalid daemon arguments line ignored\n");
+                            write_daemon_status(task_args.daemon_status_path, "FAIL");
                             return;
                         }
 
@@ -847,6 +882,7 @@ int main(int argc, char** argv)
                         if (!daemon_request_valid)
                         {
                             fprintf(stderr, "warning: invalid daemon request; use valid -i/-o/-n/-s/-t values in each pipe line\n");
+                            write_daemon_status(task_args.daemon_status_path, "FAIL");
                             return;
                         }
 
@@ -869,7 +905,9 @@ int main(int argc, char** argv)
                         std::vector<path_t> batch_input_files(1, task_args.inputpath);
                         std::vector<path_t> batch_output_files(1, task_args.outputpath);
                         int enqueued_count = submit_batch(batch_input_files, batch_output_files, task_args.scale, task_args.jobs_load);
-                        wait_batch(enqueued_count);
+                        std::pair<int, int> batch_result = wait_batch(enqueued_count);
+                        bool request_ok = enqueued_count > 0 && batch_result.second == 0;
+                        write_daemon_status(task_args.daemon_status_path, request_ok ? "OK" : "FAIL");
                     };
 
                     std::vector<std::string> request_tokens;

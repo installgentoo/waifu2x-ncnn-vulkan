@@ -17,6 +17,7 @@ OUTPUT=""
 NOISE=1
 SCALE=2
 FORMAT="png"
+STATUS_PIPE=""
 
 while getopts ":i:o:n:s:f:h" opt; do
   case "$opt" in
@@ -49,6 +50,12 @@ DAEMON_LOG="$WAIFU_STATE_DIR/daemon.log"
 is_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 read_pid() { [[ -s "$1" ]] && cat "$1" || true; }
 
+
+cleanup_client_state() {
+  [[ -n "$STATUS_PIPE" ]] && rm -f "$STATUS_PIPE"
+}
+
+trap cleanup_client_state EXIT
 stop_server_unlocked() {
   local dpid kpid
   dpid=$(read_pid "$DAEMON_PID_FILE")
@@ -99,37 +106,17 @@ ensure_watchdog_unlocked() {
   echo $! > "$WATCHDOG_PID_FILE"
 }
 
-wait_for_output() {
-  if command -v inotifywait >/dev/null 2>&1; then
-    local outdir outbase
-    outdir=$(dirname "$OUTPUT")
-    outbase=$(basename "$OUTPUT")
-    mkdir -p "$outdir"
-    while :; do
-      local got
-      got=$(inotifywait -q -e close_write --format '%f' "$outdir" 2>/dev/null || true)
-      [[ "$got" == "$outbase" ]] || continue
-      [[ -s "$OUTPUT" ]] && return 0
-    done
+wait_for_status() {
+  local status
+  if ! status=$(timeout "${WAIFU_WAIT_TIMEOUT}s" bash -ceu 'IFS= read -r line < "$1"; printf "%s" "$line"' _ "$STATUS_PIPE"); then
+    return 1
   fi
-  
-  echo "Warning: inotify-tools not installed!"
 
-  local last=-1 cur stable=0
-  while :; do
-    if [[ -f "$OUTPUT" ]]; then
-      cur=$(stat -c %s "$OUTPUT" 2>/dev/null || echo -1)
-      if [[ "$cur" -gt 0 && "$cur" -eq "$last" ]]; then
-        stable=$((stable + 1))
-      else
-        stable=0
-      fi
-      (( stable >= 2 )) && return 0
-      last="$cur"
-    fi
-    sleep 0.1
-  done
+  [[ "$status" == "OK" ]] && return 0
+  [[ "$status" == "FAIL" ]] && return 2
+  return 1
 }
+
 
 exec 200>"$LOCK"
 flock 200
@@ -141,7 +128,10 @@ is_alive "$dpid" && alive=1 || true
 if (( alive == 1 )) && [[ -s "$STARTUP_CFG_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$STARTUP_CFG_FILE"
-  if [[ "${n:-}" != "$NOISE" || ("${s:-}" == "1") != ("$SCALE" == "1") || "${f:-}" != "$FORMAT" ]]; then
+  if [[ "${n:-}" != "$NOISE" || \
+        ( "${s:-}" == "1" && "$SCALE" != "1" ) || \
+        ( "${s:-}" != "1" && "$SCALE" == "1" ) || \
+        "${f:-}" != "$FORMAT" ]]; then
     echo "Warning: restarting daemon, scale/noise incompatible!"
     alive=0
   fi
@@ -154,9 +144,26 @@ fi
 
 ensure_watchdog_unlocked
 
-printf '%s\n' "-i $INPUT -o $OUTPUT -n $NOISE -s $SCALE -f $FORMAT" > "$PIPE"
+STATUS_PIPE="$WAIFU_STATE_DIR/status.$$.${RANDOM}.fifo"
+rm -f "$STATUS_PIPE"
+mkfifo "$STATUS_PIPE"
+
+{
+  printf '%s\0' -i "$INPUT" -o "$OUTPUT" -n "$NOISE" -s "$SCALE" -f "$FORMAT" -p "$STATUS_PIPE"
+  printf '\0'
+} > "$PIPE"
 touch "$LAST_USE_FILE"
 
 flock -u 200
 
-wait_for_output
+if wait_for_status; then
+  :
+else
+  rc=$?
+  if (( rc == 2 )); then
+    echo "waifu_client.sh: daemon reported failure for output: $OUTPUT" >&2
+  else
+    echo "waifu_client.sh: timed out waiting for daemon status: $OUTPUT" >&2
+  fi
+  exit 1
+fi
