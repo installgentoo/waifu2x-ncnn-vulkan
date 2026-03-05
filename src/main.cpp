@@ -9,62 +9,11 @@
 #include <sstream>
 #include <clocale>
 
-#if _WIN32
-// image decoder and encoder with wic
-#include "wic_image.h"
-#else // _WIN32
 // image decoder and encoder with libjpeg and libpng
 #include "jpeg_image.h"
 #include "png_image.h"
-#endif // _WIN32
 #include "webp_image.h"
 
-#if _WIN32
-#include <wchar.h>
-static wchar_t* optarg = NULL;
-static int optind = 1;
-static wchar_t getopt(int argc, wchar_t* const argv[], const wchar_t* optstring)
-{
-    if (optind >= argc || argv[optind][0] != L'-')
-        return -1;
-
-    wchar_t opt = argv[optind][1];
-    const wchar_t* p = wcschr(optstring, opt);
-    if (p == NULL)
-        return L'?';
-
-    optarg = NULL;
-
-    if (p[1] == L':')
-    {
-        optind++;
-        if (optind >= argc)
-            return L'?';
-
-        optarg = argv[optind];
-    }
-
-    optind++;
-
-    return opt;
-}
-
-static std::vector<int> parse_optarg_int_array(const wchar_t* optarg)
-{
-    std::vector<int> array;
-    array.push_back(_wtoi(optarg));
-
-    const wchar_t* p = wcschr(optarg, L',');
-    while (p)
-    {
-        p++;
-        array.push_back(_wtoi(p));
-        p = wcschr(p, L',');
-    }
-
-    return array;
-}
-#else // _WIN32
 #include <unistd.h> // getopt()
 
 static std::vector<int> parse_optarg_int_array(const char* optarg)
@@ -82,7 +31,6 @@ static std::vector<int> parse_optarg_int_array(const char* optarg)
 
     return array;
 }
-#endif // _WIN32
 
 // ncnn
 #include "cpu.h"
@@ -130,7 +78,6 @@ public:
     path_t daemon_pipe;
 };
 
-#ifndef _WIN32
 static bool is_daemon_conflicting_option(int opt)
 {
     return opt == 'n' || opt == 's' || opt == 't' || opt == 'm' || opt == 'g' || opt == 'j' || opt == 'x' || opt == 'v';
@@ -203,8 +150,6 @@ static int parse_options(int argc, char** argv, Options& opt, bool daemon_reques
     return 0;
 }
 
-
-#endif // _WIN32
 
 static int collect_io_files(const path_t& inputpath, const path_t& outputpath, const path_t& format, std::vector<path_t>& input_files, std::vector<path_t>& output_files)
 {
@@ -585,71 +530,15 @@ void* save(void* args)
 }
 
 
-#if _WIN32
-int wmain(int argc, wchar_t** argv)
-#else
 int main(int argc, char** argv)
-#endif
 {
     Options opt;
 
-#if _WIN32
-    setlocale(LC_ALL, "");
-    wchar_t c;
-    while ((c = getopt(argc, argv, L"i:o:n:s:t:m:g:j:f:D:vxh")) != (wchar_t)-1)
-    {
-        switch (c)
-        {
-        case L'i':
-            opt.inputpath = optarg;
-            break;
-        case L'o':
-            opt.outputpath = optarg;
-            break;
-        case L'n':
-            opt.noise = _wtoi(optarg);
-            break;
-        case L's':
-            opt.scale = _wtoi(optarg);
-            break;
-        case L't':
-            opt.tilesize = parse_optarg_int_array(optarg);
-            break;
-        case L'm':
-            opt.model = optarg;
-            break;
-        case L'g':
-            opt.gpuid = parse_optarg_int_array(optarg);
-            break;
-        case L'j':
-            swscanf(optarg, L"%d:%*[^:]:%d", &opt.jobs_load, &opt.jobs_save);
-            opt.jobs_proc = parse_optarg_int_array(wcschr(optarg, L':') + 1);
-            break;
-        case L'f':
-            opt.format = optarg;
-            break;
-        case L'D':
-            opt.daemon_pipe = optarg;
-            break;
-        case L'v':
-            opt.verbose = 1;
-            break;
-        case L'x':
-            opt.tta_mode = 1;
-            break;
-        case L'h':
-        default:
-            print_usage();
-            return -1;
-        }
-    }
-#else // _WIN32
     if (parse_options(argc, argv, opt, false) != 0)
     {
         print_usage();
         return -1;
     }
-#endif // _WIN32
 
     path_t inputpath = opt.inputpath;
     path_t outputpath = opt.outputpath;
@@ -749,9 +638,6 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    std::vector<path_t> input_files;
-    std::vector<path_t> output_files;
-
     int prepadding = 0;
 
     if (model.find(PATHSTR("models-cunet")) != path_t::npos)
@@ -783,25 +669,6 @@ int main(int argc, char** argv)
         return -1;
     }
 
-#if _WIN32
-    wchar_t parampath[256];
-    wchar_t modelpath[256];
-    if (noise == -1)
-    {
-        swprintf(parampath, 256, L"%s/scale2.0x_model.param", model.c_str());
-        swprintf(modelpath, 256, L"%s/scale2.0x_model.bin", model.c_str());
-    }
-    else if (scale == 1)
-    {
-        swprintf(parampath, 256, L"%s/noise%d_model.param", model.c_str(), noise);
-        swprintf(modelpath, 256, L"%s/noise%d_model.bin", model.c_str(), noise);
-    }
-    else if (scale == 2 || scale == 4 || scale == 8 || scale == 16 || scale == 32)
-    {
-        swprintf(parampath, 256, L"%s/noise%d_scale2.0x_model.param", model.c_str(), noise);
-        swprintf(modelpath, 256, L"%s/noise%d_scale2.0x_model.bin", model.c_str(), noise);
-    }
-#else
     char parampath[256];
     char modelpath[256];
     if (noise == -1)
@@ -819,14 +686,9 @@ int main(int argc, char** argv)
         sprintf(parampath, "%s/noise%d_scale2.0x_model.param", model.c_str(), noise);
         sprintf(modelpath, "%s/noise%d_scale2.0x_model.bin", model.c_str(), noise);
     }
-#endif
 
     path_t paramfullpath = sanitize_filepath(parampath);
     path_t modelfullpath = sanitize_filepath(modelpath);
-
-#if _WIN32
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
-#endif
 
     ncnn::create_gpu_instance();
 
@@ -1042,7 +904,6 @@ int main(int argc, char** argv)
             {
                 run_one_request(inputpath, outputpath, format);
             }
-#ifndef _WIN32
             else
             {
                 for (;;)
@@ -1087,7 +948,6 @@ int main(int argc, char** argv)
                     fclose(pipe_fp);
                 }
             }
-#endif
 
             Task end;
             end.id = -233;
