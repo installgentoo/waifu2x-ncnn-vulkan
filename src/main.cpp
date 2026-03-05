@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <vector>
@@ -233,109 +236,95 @@ private:
 TaskQueue toproc;
 TaskQueue tosave;
 
-class Session
+class LoadThreadParams
 {
 public:
-    Session() : pending(0) {}
-
-    void start_task()
-    {
-        lock.lock();
-        pending++;
-        lock.unlock();
-    }
-
-    void finish_task()
-    {
-        lock.lock();
-        pending--;
-        cond.signal();
-        lock.unlock();
-    }
-
-    void wait_all()
-    {
-        lock.lock();
-        while (pending > 0)
-            cond.wait(lock);
-        lock.unlock();
-    }
-
-private:
-    ncnn::Mutex lock;
-    ncnn::ConditionVariable cond;
-    int pending;
+    int scale;
+    int jobs_load;
+    std::vector<path_t> input_files;
+    std::vector<path_t> output_files;
+    std::atomic<int>* enqueued_count;
 };
 
-Session session;
+static std::atomic<int> saved_task_count(0);
+static std::mutex saved_task_count_mutex;
+static std::condition_variable saved_task_count_cv;
 
-static int enqueue_image_task(const path_t& inputpath, const path_t& outputpath, int scale, int id)
+void* load(void* args)
 {
-    unsigned char* pixeldata = 0;
-    int w;
-    int h;
-    int c;
+    const LoadThreadParams* ltp = (const LoadThreadParams*)args;
+    const int count = ltp->input_files.size();
+    const int scale = ltp->scale;
 
-    FILE* fp = fopen(inputpath.c_str(), "rb");
-    if (fp)
+    #pragma omp parallel for schedule(static,1) num_threads(ltp->jobs_load)
+    for (int i=0; i<count; i++)
     {
-        // read whole file
-        unsigned char* filedata = 0;
-        int length = 0;
+        const path_t& imagepath = ltp->input_files[i];
+
+        unsigned char* pixeldata = 0;
+        int w;
+        int h;
+        int c;
+
+        FILE* fp = fopen(imagepath.c_str(), "rb");
+        if (fp)
         {
-            fseek(fp, 0, SEEK_END);
-            length = ftell(fp);
-            rewind(fp);
-            filedata = (unsigned char*)malloc(length);
+            unsigned char* filedata = 0;
+            int length = 0;
+            {
+                fseek(fp, 0, SEEK_END);
+                length = ftell(fp);
+                rewind(fp);
+                filedata = (unsigned char*)malloc(length);
+                if (filedata)
+                {
+                    fread(filedata, 1, length, fp);
+                }
+                fclose(fp);
+            }
+
             if (filedata)
             {
-                fread(filedata, 1, length, fp);
-            }
-            fclose(fp);
-        }
-
-        if (filedata)
-        {
-            pixeldata = webp_load(filedata, length, &w, &h, &c);
-            if (!pixeldata)
-            {
-                // not webp, try jpg png etc.
-                pixeldata = jpeg_load(filedata, length, &w, &h, &c);
+                pixeldata = webp_load(filedata, length, &w, &h, &c);
                 if (!pixeldata)
                 {
-                    pixeldata = png_load(filedata, length, &w, &h, &c);
+                    pixeldata = jpeg_load(filedata, length, &w, &h, &c);
+                    if (!pixeldata)
+                    {
+                        pixeldata = png_load(filedata, length, &w, &h, &c);
+                    }
                 }
+
+                free(filedata);
             }
-
-            free(filedata);
         }
+
+        if (!pixeldata)
+        {
+            fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
+            continue;
+        }
+
+        Task v;
+        v.id = i;
+        v.scale = scale;
+        v.inpath = imagepath;
+        v.outpath = ltp->output_files[i];
+        v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+
+        path_t ext = get_file_extension(v.outpath);
+        if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
+        {
+            path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
+            v.outpath = output_filename2;
+            fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
+        }
+
+        toproc.put(v);
+        ltp->enqueued_count->fetch_add(1);
     }
 
-    if (!pixeldata)
-    {
-        fprintf(stderr, "decode image %s failed\n", inputpath.c_str());
-        return -1;
-    }
-
-    Task v;
-    v.id = id;
-    v.scale = scale;
-    v.inpath = inputpath;
-    v.outpath = outputpath;
-    v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
-
-    path_t ext = get_file_extension(v.outpath);
-    if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
-    {
-        path_t output_filename2 = outputpath + PATHSTR(".png");
-        v.outpath = output_filename2;
-        fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", inputpath.c_str(), inputpath.c_str(), output_filename2.c_str());
-    }
-
-    session.start_task();
-    toproc.put(v);
-
-    return 1;
+    return 0;
 }
 
 class ProcThreadParams
@@ -460,7 +449,8 @@ void* save(void* args)
             fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
         }
 
-        session.finish_task();
+        saved_task_count.fetch_add(1);
+        saved_task_count_cv.notify_all();
     }
 
     return 0;
@@ -782,7 +772,35 @@ int main(int argc, char** argv)
                 save_threads[i] = new ncnn::Thread(save, (void*)&stp);
             }
 
-            int task_id = 0;
+            auto submit_batch = [](const std::vector<path_t>& input_files, const std::vector<path_t>& output_files, int scale, int jobs_load) -> int
+            {
+                std::atomic<int> enqueued_count(0);
+
+                LoadThreadParams ltp;
+                ltp.scale = scale;
+                ltp.jobs_load = jobs_load;
+                ltp.input_files = input_files;
+                ltp.output_files = output_files;
+                ltp.enqueued_count = &enqueued_count;
+
+                ncnn::Thread load_thread(load, (void*)&ltp);
+                load_thread.join();
+
+                return enqueued_count.load();
+            };
+
+            auto wait_batch = [](int expected_count)
+            {
+                if (expected_count <= 0)
+                    return;
+
+                const int baseline = saved_task_count.load();
+                std::unique_lock<std::mutex> guard(saved_task_count_mutex);
+                saved_task_count_cv.wait(guard, [baseline, expected_count]() {
+                    return saved_task_count.load() >= baseline + expected_count;
+                });
+            };
+
             if (daemon_mode)
             {
                 FILE* pipefp = fopen(args.daemon_pipe.c_str(), "r");
@@ -851,8 +869,10 @@ int main(int argc, char** argv)
                             waifu2x[i]->tilesize = task_args.tilesize.empty() ? tilesize[i] : task_args.tilesize[i];
                         }
 
-                        if (enqueue_image_task(task_args.inputpath, task_args.outputpath, task_args.scale, task_id++) > 0)
-                            session.wait_all();
+                        std::vector<path_t> batch_input_files(1, task_args.inputpath);
+                        std::vector<path_t> batch_output_files(1, task_args.outputpath);
+                        int enqueued_count = submit_batch(batch_input_files, batch_output_files, task_args.scale, task_args.jobs_load);
+                        wait_batch(enqueued_count);
                     }
 
                     fclose(pipefp);
@@ -860,8 +880,10 @@ int main(int argc, char** argv)
             }
             else
             {
-                enqueue_image_task(args.inputpath, args.outputpath, scale, task_id++);
-                session.wait_all();
+                std::vector<path_t> batch_input_files(1, args.inputpath);
+                std::vector<path_t> batch_output_files(1, args.outputpath);
+                int enqueued_count = submit_batch(batch_input_files, batch_output_files, scale, jobs_load);
+                wait_batch(enqueued_count);
             }
 
             Task end;
