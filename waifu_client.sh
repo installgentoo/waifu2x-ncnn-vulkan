@@ -66,6 +66,8 @@ start_server_unlocked() {
   mkfifo "$PIPE"
 
   (
+    cd "$WAIFU_STATE_DIR"
+
     _daemon_pid=""
     _cleanup() {
       [[ -n "$_daemon_pid" ]] && kill "$_daemon_pid" 2>/dev/null || true
