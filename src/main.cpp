@@ -1,15 +1,8 @@
 // waifu2x implemented with ncnn library
 
-#include <stdio.h>
 #include <string.h>
-#include <algorithm>
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include <future>
 #include <queue>
-#include <string>
-#include <vector>
-#include <utility>
 // image decoder and encoder with libjpeg and libpng
 #include "jpeg_image.h"
 #include "png_image.h"
@@ -190,6 +183,8 @@ public:
 
     ncnn::Mat inimage;
     ncnn::Mat outimage;
+
+    path_t daemon_status_path;  // non-empty only in daemon mode
 };
 
 class TaskQueue
@@ -248,13 +243,7 @@ public:
     int jobs_load;
     std::vector<path_t> input_files;
     std::vector<path_t> output_files;
-    std::atomic<int>* enqueued_count;
 };
-
-static std::atomic<int> saved_task_count(0);
-static std::atomic<int> failed_task_count(0);
-static std::mutex task_count_mutex;
-static std::condition_variable task_count_cv;
 
 void* load(void* args)
 {
@@ -305,29 +294,29 @@ void* load(void* args)
             }
         }
 
-        if (!pixeldata)
+        if (pixeldata)
+        {
+            Task v;
+            v.id = i;
+            v.scale = scale;
+            v.inpath = imagepath;
+            v.outpath = ltp->output_files[i];
+            v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+
+            path_t ext = get_file_extension(v.outpath);
+            if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
+            {
+                path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
+                v.outpath = output_filename2;
+                fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
+            }
+
+            toproc.put(v);
+        }
+        else
         {
             fprintf(stderr, "decode image %s failed\n", imagepath.c_str());
-            continue;
         }
-
-        Task v;
-        v.id = i;
-        v.scale = scale;
-        v.inpath = imagepath;
-        v.outpath = ltp->output_files[i];
-        v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
-
-        path_t ext = get_file_extension(v.outpath);
-        if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
-        {
-            path_t output_filename2 = ltp->output_files[i] + PATHSTR(".png");
-            v.outpath = output_filename2;
-            fprintf(stderr, "image %s has alpha channel ! %s will output %s\n", imagepath.c_str(), imagepath.c_str(), output_filename2.c_str());
-        }
-
-        toproc.put(v);
-        ltp->enqueued_count->fetch_add(1);
     }
 
     return 0;
@@ -455,12 +444,19 @@ void* save(void* args)
             fprintf(stderr, "encode image %s failed\n", v.outpath.c_str());
         }
 
-        if (success)
-            saved_task_count.fetch_add(1);
-        else
-            failed_task_count.fetch_add(1);
-
-        task_count_cv.notify_all();
+        if (!v.daemon_status_path.empty())
+        {
+            FILE* statusfp = fopen(v.daemon_status_path.c_str(), "wb");
+            if (statusfp)
+            {
+                fprintf(statusfp, "%s\n", success ? "OK" : "FAIL");
+                fclose(statusfp);
+            }
+            else
+            {
+                fprintf(stderr, "warning: failed to write daemon status %s\n", v.daemon_status_path.c_str());
+            }
+        }
     }
 
     return 0;
@@ -782,39 +778,6 @@ int main(int argc, char** argv)
                 save_threads[i] = new ncnn::Thread(save, (void*)&stp);
             }
 
-            auto submit_batch = [](const std::vector<path_t>& input_files, const std::vector<path_t>& output_files, int scale, int jobs_load) -> int
-            {
-                std::atomic<int> enqueued_count(0);
-
-                LoadThreadParams ltp;
-                ltp.scale = scale;
-                ltp.jobs_load = jobs_load;
-                ltp.input_files = input_files;
-                ltp.output_files = output_files;
-                ltp.enqueued_count = &enqueued_count;
-
-                ncnn::Thread load_thread(load, (void*)&ltp);
-                load_thread.join();
-
-                return enqueued_count.load();
-            };
-
-            auto wait_batch = [](int expected_count) -> std::pair<int, int>
-            {
-                if (expected_count <= 0)
-                    return std::make_pair(0, 0);
-
-                const int baseline_saved = saved_task_count.load();
-                const int baseline_failed = failed_task_count.load();
-                std::unique_lock<std::mutex> guard(task_count_mutex);
-                task_count_cv.wait(guard, [baseline_saved, baseline_failed, expected_count]() {
-                    int done = (saved_task_count.load() - baseline_saved) + (failed_task_count.load() - baseline_failed);
-                    return done >= expected_count;
-                });
-
-                return std::make_pair(saved_task_count.load() - baseline_saved, failed_task_count.load() - baseline_failed);
-            };
-
             if (daemon_mode)
             {
                 FILE* pipefp = fopen(args.daemon_pipe.c_str(), "rb");
@@ -824,24 +787,16 @@ int main(int argc, char** argv)
                 }
                 else
                 {
-                    auto write_daemon_status = [](const path_t& status_path, const char* status)
+                    auto write_fail_status = [](const path_t& status_path)
                     {
                         if (status_path.empty())
                             return;
-
-#if _WIN32
-                        FILE* statusfp = _wfopen(status_path.c_str(), L"wb");
-#else
                         FILE* statusfp = fopen(status_path.c_str(), "wb");
-#endif
-                        if (!statusfp)
+                        if (statusfp)
                         {
-                            fprintf(stderr, "warning: failed to write daemon status %s\n", status_path.c_str());
-                            return;
+                            fprintf(statusfp, "FAIL\n");
+                            fclose(statusfp);
                         }
-
-                        fprintf(statusfp, "%s\n", status);
-                        fclose(statusfp);
                     };
 
                     auto process_daemon_request = [&](const std::vector<std::string>& request_tokens)
@@ -865,7 +820,7 @@ int main(int argc, char** argv)
                         if (parse_args(line_argc, line_argv, task_args, task_meta) != 0)
                         {
                             fprintf(stderr, "invalid daemon arguments line ignored\n");
-                            write_daemon_status(task_args.daemon_status_path, "FAIL");
+                            write_fail_status(task_args.daemon_status_path);
                             return;
                         }
 
@@ -882,7 +837,7 @@ int main(int argc, char** argv)
                         if (!daemon_request_valid)
                         {
                             fprintf(stderr, "warning: invalid daemon request; use valid -i/-o/-n/-s/-t values in each pipe line\n");
-                            write_daemon_status(task_args.daemon_status_path, "FAIL");
+                            write_fail_status(task_args.daemon_status_path);
                             return;
                         }
 
@@ -902,12 +857,54 @@ int main(int argc, char** argv)
                             waifu2x[i]->tilesize = task_args.tilesize.empty() ? tilesize[i] : task_args.tilesize[i];
                         }
 
-                        std::vector<path_t> batch_input_files(1, task_args.inputpath);
-                        std::vector<path_t> batch_output_files(1, task_args.outputpath);
-                        int enqueued_count = submit_batch(batch_input_files, batch_output_files, task_args.scale, task_args.jobs_load);
-                        std::pair<int, int> batch_result = wait_batch(enqueued_count);
-                        bool request_ok = enqueued_count > 0 && batch_result.second == 0;
-                        write_daemon_status(task_args.daemon_status_path, request_ok ? "OK" : "FAIL");
+                        // load image inline
+                        unsigned char* pixeldata = 0;
+                        int w = 0, h = 0, c = 0;
+                        {
+                            FILE* fp = fopen(task_args.inputpath.c_str(), "rb");
+                            if (fp)
+                            {
+                                fseek(fp, 0, SEEK_END);
+                                int length = ftell(fp);
+                                rewind(fp);
+                                unsigned char* filedata = (unsigned char*)malloc(length);
+                                if (filedata)
+                                {
+                                    fread(filedata, 1, length, fp);
+                                    pixeldata = webp_load(filedata, length, &w, &h, &c);
+                                    if (!pixeldata)
+                                        pixeldata = jpeg_load(filedata, length, &w, &h, &c);
+                                    if (!pixeldata)
+                                        pixeldata = png_load(filedata, length, &w, &h, &c);
+                                    free(filedata);
+                                }
+                                fclose(fp);
+                            }
+                        }
+
+                        if (!pixeldata)
+                        {
+                            fprintf(stderr, "decode image %s failed\n", task_args.inputpath.c_str());
+                            write_fail_status(task_args.daemon_status_path);
+                            return;
+                        }
+
+                        Task v;
+                        v.id = 0;
+                        v.scale = task_args.scale;
+                        v.inpath = task_args.inputpath;
+                        v.outpath = task_args.outputpath;
+                        v.inimage = ncnn::Mat(w, h, (void*)pixeldata, (size_t)c, c);
+                        v.daemon_status_path = task_args.daemon_status_path;
+
+                        path_t ext = get_file_extension(v.outpath);
+                        if (c == 4 && (ext == PATHSTR("jpg") || ext == PATHSTR("JPG") || ext == PATHSTR("jpeg") || ext == PATHSTR("JPEG")))
+                        {
+                            v.outpath = v.outpath + PATHSTR(".png");
+                            fprintf(stderr, "image %s has alpha channel ! will output %s\n", task_args.inputpath.c_str(), v.outpath.c_str());
+                        }
+
+                        toproc.put(v);
                     };
 
                     std::vector<std::string> request_tokens;
@@ -953,10 +950,15 @@ int main(int argc, char** argv)
             }
             else
             {
-                std::vector<path_t> batch_input_files(1, args.inputpath);
-                std::vector<path_t> batch_output_files(1, args.outputpath);
-                int enqueued_count = submit_batch(batch_input_files, batch_output_files, scale, jobs_load);
-                wait_batch(enqueued_count);
+                // non-daemon: single file, original simple path
+                LoadThreadParams ltp;
+                ltp.scale = scale;
+                ltp.jobs_load = jobs_load;
+                ltp.input_files.push_back(args.inputpath);
+                ltp.output_files.push_back(args.outputpath);
+
+                ncnn::Thread load_thread(load, (void*)&ltp);
+                load_thread.join();
             }
 
             Task end;

@@ -78,7 +78,7 @@ start_server_unlocked() {
     # Hold fifo open to prevent EOF when short-lived writers close.
     exec 9<>"$PIPE"
 
-    "$WAIFU_BIN" -D "$PIPE" -n "$NOISE" -s "$SCALE" -f "$FORMAT" >/dev/null 2>>"$DAEMON_LOG" &
+    "$WAIFU_BIN" -D "$PIPE" -j 1:2:3 -n "$NOISE" -s "$SCALE" -f "$FORMAT" >/dev/null 2>>"$DAEMON_LOG" &
     _daemon_pid=$!
 
     # Watchdog: idle-shutdown loop
